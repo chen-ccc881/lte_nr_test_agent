@@ -1,0 +1,49 @@
+# ===== 密钥与本地环境 =====
+.env
+.env.*
+!.env.example
+
+# ===== Python 虚拟环境与缓存 =====
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# ===== 向量库 / 运行时产物（体积大、可再生） =====
+.chroma/
+artifacts/uploads/temp/
+logs/
+*.log
+
+# ===== 长期记忆库（含历史案例数据，按需决定） =====
+memory/cases.db
+memory/cases.db-*
+memory/*.jsonl
+
+# ===== 本地生成的测试/运行结果 =====
+run_result.json
+real_run_result.json
+
+# ===== 外部大文件与专有依赖（体积大/版权原因，不入库） =====
+# 3GPP 协议文档（18MB，版权归属标准组织，建议本地放置）
+docs/3gpp/*.doc
+docs/3gpp/*.docx
+docs/3gpp/*.pdf
+docx/
+# QCAT/Xtrace 依赖的本地字典与 DLL（由本机安装提供）
+protocols/xtraceLib/*.dll
+protocols/xtraceLib/*.pyd
+
+# ===== Office 临时锁文件 =====
+~$*
+
+# ===== IDE / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

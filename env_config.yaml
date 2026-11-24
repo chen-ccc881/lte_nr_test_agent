@@ -1,0 +1,33 @@
+agent:
+  force_offline: false
+python:
+  interpreter: 'C:\Program Files\Python310\python.exe'
+  framework_root: 'C:\Users\Administrator\Downloads\Tools_B5140_ltev2_T1997_OptSchd_0826_T44\tool\bjckAutotest'
+weblmt:
+  ip: 172.16.44.139
+  port: '8090'
+  username: admin
+  password: env:WEBLMT_PASSWORD
+  driver_path: ''
+  browser_type: Chrome
+gnb:
+  gnb_type: B5140DUAL
+  debug_ip: 172.16.44.139
+  ssh_ip: 172.16.44.139
+  ssh_user: root
+  ssh_password: env:GNB_SSH_PASSWORD
+maintenance_tool:
+  local_pc_ip: 172.16.44.133
+  tool_path: ''
+  tool_mode: Autotest
+  is_save_qxdm: false
+paths:
+  trace_log_dir: artifacts/xtrace
+  sv_log_dir: artifacts/sv
+  qxdm_log_dir: artifacts/qxdm
+  devicelog_dir: artifacts/devicelog
+  parsed_dir: artifacts/parsed
+trace:
+  trace_me_port: '6060'
+  sig_trace_port: '6080'
+  move_xst: true
