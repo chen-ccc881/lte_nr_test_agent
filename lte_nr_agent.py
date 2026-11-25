@@ -167,6 +167,17 @@ def _resolve_doc_dirs() -> list[Path]:
 RAG_DOC_DIRS = _resolve_doc_dirs()
 RAG_DOC_DIR = RAG_DOC_DIRS[0]
 RAG_COLLECTION_NAME = os.getenv("RAG_COLLECTION_NAME", "lte_nr_tech_docs")
+# 混合检索开关与权重（向量语义 + BM25 关键词，RRF 融合）
+RAG_HYBRID_ENABLED = os.getenv("RAG_HYBRID_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+RAG_WEIGHT_VECTOR = _env_float("RAG_WEIGHT_VECTOR", 1.0)
+RAG_WEIGHT_BM25 = _env_float("RAG_WEIGHT_BM25", 1.0)
+# 上下文压缩/过滤（rerank 之后：阈值过滤→去重→句子压缩→预算截断）
+RAG_FILTER_ENABLED = os.getenv("RAG_FILTER_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+RAG_MIN_SCORE = _env_float("RAG_MIN_SCORE", -5.0)
+RAG_SCORE_RATIO = _env_float("RAG_SCORE_RATIO", 0.25)
+RAG_DEDUP_THRESHOLD = _env_float("RAG_DEDUP_THRESHOLD", 0.82)
+RAG_CHUNK_MAX_CHARS = int(os.getenv("RAG_CHUNK_MAX_CHARS", "600"))
+RAG_CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONTEXT_MAX_CHARS", "8000"))
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", BASE_DIR / ".chroma" / "3gpp"))
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -734,24 +745,52 @@ class APIBasedEmbeddings(Embeddings):
         return self._embed([text])[0]
 
 
+class LocalSemanticEmbeddings(Embeddings):
+    """本地语义向量（fastembed + bge-small-zh），完全离线、无外部服务依赖。
+
+    相比 HashingEmbeddings 的词袋哈希，这是真正的中文语义向量，可匹配
+    "峰值吞吐量"↔"下行峰值速率"这类同义表述。
+    """
+
+    def __init__(self, model: str | None = None):
+        from fastembed import TextEmbedding
+
+        self.model_name = model or os.getenv(
+            "RAG_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"
+        )
+        self._model = TextEmbedding(model_name=self.model_name)
+        self.dimension = 512
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        # fastembed 返回 numpy.float32，Chroma 需要原生 Python float
+        return [[float(x) for x in v] for v in self._model.embed(list(texts))]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [float(x) for x in next(iter(self._model.embed([text])))]
+
+
 def build_embeddings() -> Embeddings:
-    """按配置构建 embedding：auto/api 优先用远端语义向量，失败回退哈希。"""
-    mode = os.getenv("RAG_EMBEDDING_MODE", "auto").strip().lower()
+    """按配置构建 embedding：本地语义优先，失败回退哈希。
+
+    模式：
+    - local（默认）：BAAI/bge-small-zh 本地语义向量；不可用时回退哈希；
+    - hash：强制哈希向量（离线兜底）；
+    - api/kinfra：兼容旧配置名，仍回退到本地语义再哈希。
+    """
+    mode = os.getenv("RAG_EMBEDDING_MODE", "local").strip().lower()
     if mode == "hash":
         return HashingEmbeddings()
-    model = os.getenv("RAG_EMBEDDING_MODEL", "kinfra-text-embedding-0.6b")
     try:
-        emb = APIBasedEmbeddings(model, API_KEY, API_BASE)
-        # 探测一次，确认服务可用且维度有效
+        emb = LocalSemanticEmbeddings()
         probe = emb.embed_query("LTE 随机接入")
         if not probe or len(probe) < 8:
             raise ValueError("embedding 维度异常")
-        logger.info("RAG Embedding 使用 %s（维度=%d）", model, len(probe))
+        logger.info("RAG Embedding 使用本地语义模型 %s（维度=%d）", emb.model_name, len(probe))
         return emb
     except Exception as exc:
-        if mode == "api":
-            raise RuntimeError(f"RAG_EMBEDDING_MODE=api 但 embedding 不可用：{exc}") from exc
-        logger.warning("远端 Embedding 不可用（%s），回退到 HashingEmbeddings", exc)
+        logger.warning("本地语义 Embedding 不可用（%s），回退到 HashingEmbeddings", exc)
         return HashingEmbeddings()
 
 
@@ -1066,6 +1105,11 @@ def load_local_documents(doc_dirs: Path | Sequence[Path]) -> tuple[list[Document
 load_3gpp_documents = load_local_documents
 
 
+# BM25 关键词索引（与 Chroma 向量库共存，混合检索用）
+_bm25_index = None
+_bm25_documents: list = []
+
+
 def build_protocol_retriever():
     """构建/加载 Chroma 向量库；无可用文档或构建失败时返回 None。
 
@@ -1081,7 +1125,9 @@ def build_protocol_retriever():
     try:
         embeddings = build_embeddings()
         dim = getattr(embeddings, "dimension", None) or len(embeddings.embed_query("维度探测"))
-        collection_name = f"{RAG_COLLECTION_NAME}_e{dim}"
+        # 按 embedding 类型区分集合：同为512维的哈希与语义向量语义空间不同，不可混用
+        emb_tag = "bge" if isinstance(embeddings, LocalSemanticEmbeddings) else "hash"
+        collection_name = f"{RAG_COLLECTION_NAME}_{emb_tag}{dim}"
         vectorstore = Chroma.from_documents(
             documents=documents,
             embedding=embeddings,
@@ -1089,6 +1135,19 @@ def build_protocol_retriever():
             collection_name=collection_name,
             persist_directory=str(CHROMA_DIR),
         )
+        # 同步构建 BM25 关键词索引（与向量库共用同一批 documents）
+        try:
+            import jieba
+            from rank_bm25 import BM25Okapi
+
+            global _bm25_index, _bm25_documents
+            _bm25_documents = documents
+            corpus = [list(jieba.cut(d.page_content)) for d in documents]
+            _bm25_index = BM25Okapi(corpus)
+            logger.info("BM25关键词索引构建完成：docs=%d", len(documents))
+        except Exception as exc:
+            logger.warning("BM25索引构建失败（%s），混合检索降级为纯向量", exc)
+
         logger.info("Chroma向量库构建完成：docs=%d, collection=%s, dir=%s",
                     len(documents), collection_name, CHROMA_DIR)
         return vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -1099,10 +1158,211 @@ def build_protocol_retriever():
 
 protocol_retriever = build_protocol_retriever()
 
+# ===== Rerank 重排（bge-reranker，懒加载单例）=====
+RAG_RERANK_ENABLED = os.getenv("RAG_RERANK_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+_reranker = None
+_reranker_tried = False
+
+
+def _get_reranker():
+    """懒加载 cross-encoder 重排器；不可用时返回 None（跳过重排）。"""
+    global _reranker, _reranker_tried
+    if _reranker_tried:
+        return _reranker
+    _reranker_tried = True
+    try:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+        model = os.getenv("RAG_RERANK_MODEL", "BAAI/bge-reranker-v2-m3-int8")
+        _reranker = TextCrossEncoder(model_name=model)
+        logger.info("RAG Reranker 加载完成：%s", model)
+    except Exception as exc:
+        logger.warning("RAG Reranker 不可用（%s），跳过重排", exc)
+        _reranker = None
+    return _reranker
+
+
+def _doc_key(doc) -> str:
+    """用 metadata 生成文档稳定键，供两路检索结果去重对齐。"""
+    meta = getattr(doc, "metadata", {}) or {}
+    return (
+        f"{meta.get('source', '')}|{meta.get('page', '')}|{meta.get('chunk', '')}"
+        f"|{hash(getattr(doc, 'page_content', '')[:100])}"
+    )
+
+
+def _hybrid_search(query: str, top_n: int) -> list:
+    """向量检索 + BM25 关键词检索，用 RRF（倒数排名融合）合并。
+
+    两路分数制式不同（余弦相似度 vs BM25 分），RRF 只用排名融合，无需归一化。
+    任一路失败时降级为另一路；全部失败返回空列表由上层处理。
+    """
+    from collections import defaultdict
+
+    results: list = []
+    vector_ok, bm25_ok = False, False
+
+    # 1) 向量检索路
+    try:
+        if protocol_retriever is not None:
+            vs = getattr(protocol_retriever, "search_kwargs", {})
+            vs["k"] = top_n
+            vector_docs = protocol_retriever.invoke(query)
+            results.append(("vector", vector_docs))
+            vector_ok = True
+    except Exception as exc:
+        logger.warning("混合检索-向量路失败：%s", exc)
+
+    # 2) BM25 关键词路
+    try:
+        if _bm25_index is not None and _bm25_documents:
+            import jieba
+
+            tokens = list(jieba.cut(query))
+            scores = _bm25_index.get_scores(tokens)
+            ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
+            # 只保留 BM25 分数 > 0 的文档，避免无意义命中
+            ranked = [i for i in ranked if scores[i] > 0]
+            bm25_docs = [_bm25_documents[i] for i in ranked]
+            results.append(("bm25", bm25_docs))
+            bm25_ok = True
+    except Exception as exc:
+        logger.warning("混合检索-BM25路失败：%s", exc)
+
+    if not vector_ok and not bm25_ok:
+        return []
+    if not bm25_ok or not vector_ok:
+        # 单路可用：直接返回该路结果
+        return results[0][1]
+
+    # 3) RRF 融合：两路都成功时按排名倒数加权累加
+    rrf = defaultdict(float)
+    doc_by_key = {}
+    for source, docs in results:
+        weight = RAG_WEIGHT_VECTOR if source == "vector" else RAG_WEIGHT_BM25
+        for rank, doc in enumerate(docs, start=1):
+            key = _doc_key(doc)
+            rrf[key] += weight / (60.0 + rank)
+            doc_by_key[key] = doc
+
+    ordered = sorted(rrf, key=lambda k: rrf[k], reverse=True)[:top_n]
+    return [doc_by_key[k] for k in ordered]
+
+
+# ===== 上下文压缩/过滤（rerank 之后处理）=====
+def _bigrams(text: str) -> set:
+    """字符 2-gram 集合，用于轻量文本相似度与句子打分。"""
+    s = re.sub(r"\s+", "", text)
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _bigram_jaccard(a: str, b: str) -> float:
+    ga, gb = _bigrams(a), _bigrams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def _filter_by_relevance(docs: list, scores: list, min_chunks: int = 1) -> tuple:
+    """按 rerank 分数双阈值过滤；全被过滤时保底最高分片段。"""
+    if not docs or not scores or len(scores) != len(docs):
+        return docs, scores
+    best = max(scores)
+    # 相对阈值用 max(s,0) 避免负分比例失真
+    keep = [
+        (d, s) for d, s in zip(docs, scores)
+        if s >= RAG_MIN_SCORE and max(s, 0.0) >= max(best, 0.0) * RAG_SCORE_RATIO
+    ]
+    if not keep:
+        best_idx = scores.index(best)
+        return [docs[best_idx]], [scores[best_idx]]
+    return [x[0] for x in keep], [x[1] for x in keep]
+
+
+def _dedup_chunks(docs: list, scores: list) -> tuple:
+    """按字符 2-gram Jaccard 去重，分数高的先入保留集。"""
+    if not docs:
+        return docs, scores
+    # 按分数降序处理，保证保留最相关的那份
+    order = sorted(range(len(docs)), key=lambda i: scores[i], reverse=True)
+    kept_idx = []
+    for i in order:
+        if any(_bigram_jaccard(docs[i].page_content, docs[j].page_content) >= RAG_DEDUP_THRESHOLD
+               for j in kept_idx):
+            continue
+        kept_idx.append(i)
+    kept_idx.sort()  # 恢复原分数顺序
+    return [docs[i] for i in kept_idx], [scores[i] for i in kept_idx]
+
+
+def _compress_chunk(query: str, text: str, max_chars: int) -> str:
+    """句子级压缩：按与 query 的字符2-gram重合度保留相关句；表格行整行保留。"""
+    if len(text) <= max_chars:
+        return text
+    # 表格行（| 开头）作为整体单元保留，不参与切句
+    table_lines = [ln for ln in text.split("\n") if ln.strip().startswith("|")]
+    table_text = "\n".join(table_lines)
+
+    sentences = [s for s in re.split(r"(?<=[。！？\n])", text)
+                 if s.strip() and not s.strip().startswith("|")]
+    q_grams = _bigrams(query)
+    scored = [(len(_bigrams(s) & q_grams), s) for s in sentences]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    out, total = [], 0
+    if table_text:
+        out.append(table_text[:max_chars])
+        total += len(out[0])
+    for _score, s in scored:
+        if total + len(s) > max_chars:
+            continue
+        out.append(s)
+        total += len(s)
+    if not out:
+        return text[:max_chars]  # 保底
+    # 按原文顺序重排，避免句子乱序
+    return "".join(out) if not table_text else "\n".join(out)
+
+
+def _compress_context(query: str, docs: list, scores: list, top_k: int) -> list:
+    """总入口：阈值过滤 → 去重 → 句子压缩 → 全局预算截断。每步异常独立降级。"""
+    from copy import copy as _copy
+
+    try:
+        docs, scores = _filter_by_relevance(docs, scores)
+    except Exception as exc:
+        logger.warning("上下文过滤-阈值步骤失败：%s", exc)
+    try:
+        docs, scores = _dedup_chunks(docs, scores)
+    except Exception as exc:
+        logger.warning("上下文过滤-去重步骤失败：%s", exc)
+
+    compressed = []
+    for doc in docs:
+        try:
+            text = _compress_chunk(query, doc.page_content, RAG_CHUNK_MAX_CHARS)
+        except Exception as exc:
+            logger.warning("上下文过滤-压缩步骤失败：%s", exc)
+            text = doc.page_content
+        if text != doc.page_content:
+            doc = _copy(doc)
+            doc.page_content = text
+        compressed.append(doc)
+
+    # 全局预算截断
+    out, total = [], 0
+    for doc in compressed:
+        if total + len(doc.page_content) > RAG_CONTEXT_MAX_CHARS:
+            break
+        out.append(doc)
+        total += len(doc.page_content)
+    return out[:top_k]
+
 
 @tool
 def rag_protocol_query(query: str, top_k: int = 4) -> str:
     """检索本地技术资料片段，来源支持 pdf / docx / doc，不限制主题。
+    检索后在候选集中用 cross-encoder 重排，返回最相关的 top_k 片段。
     Args:
         query: 检索问题，例如 PRACH NCS配置、测试脚本规范或任意本地资料中的问题。
         top_k: 返回片段数量。
@@ -1114,18 +1374,52 @@ def rag_protocol_query(query: str, top_k: int = 4) -> str:
                 "RAG不可用：未检索到本地技术文档。"
                 f"请将 pdf/doc/docx 文件放入 {dirs} 后重启程序；禁止编造文档内容。"
             )
-        retriever = protocol_retriever
-        search_kwargs = getattr(retriever, "search_kwargs", {})
-        search_kwargs["k"] = top_k
-        docs = retriever.invoke(query)
+        # 多取候选片段供重排
+        candidates_n = max(top_k * 3, top_k) if RAG_RERANK_ENABLED else top_k
+        candidates_n = min(candidates_n, int(os.getenv("RAG_RERANK_CANDIDATES", "12")))
+        if RAG_HYBRID_ENABLED and _bm25_index is not None:
+            docs = _hybrid_search(query, candidates_n)  # 向量+BM25 混合召回
+        else:
+            search_kwargs = getattr(protocol_retriever, "search_kwargs", {})
+            search_kwargs["k"] = candidates_n
+            docs = protocol_retriever.invoke(query)     # 降级：纯向量召回
         if not docs:
             return "未在本地技术资料向量库中检索到相关片段，禁止编造文档内容。"
+
+        reranked = False
+        scores = None
+        if RAG_RERANK_ENABLED and len(docs) > top_k:
+            rr = _get_reranker()
+            if rr is not None:
+                try:
+                    passages = [d.page_content for d in docs]
+                    all_scores = list(rr.rerank(query, passages))
+                    ordered = sorted(
+                        range(len(docs)), key=lambda i: all_scores[i], reverse=True
+                    )[:top_k]
+                    docs = [docs[i] for i in ordered]
+                    scores = [all_scores[i] for i in ordered]  # 分数与文档同步重排
+                    reranked = True
+                except Exception as exc:
+                    logger.warning("RAG 重排失败（%s），使用原始检索顺序", exc)
+        # 无论是否重排，最终都截断到 top_k
+        docs = docs[:top_k]
+
+        tag = "重排" if reranked else "检索"
+        # 上下文压缩/过滤：rerank 之后按阈值→去重→压缩→预算处理
+        if RAG_FILTER_ENABLED and scores is not None:
+            try:
+                docs = _compress_context(query, docs, scores, top_k)
+                tag = "压缩"
+            except Exception as exc:
+                logger.warning("上下文压缩失败（%s），使用未压缩结果", exc)
+
         parts = []
         for idx, doc in enumerate(docs, start=1):
             meta = doc.metadata or {}
             source = meta.get("source", "unknown")
             page = meta.get("page", "?")
-            parts.append(f"[片段{idx}] 来源={source}, 页码={page}\n{doc.page_content}")
+            parts.append(f"[片段{idx}/{tag}] 来源={source}, 页码={page}\n{doc.page_content}")
         return "\n\n".join(parts)
     except Exception as exc:
         logger.exception("RAG检索工具失败：%s", exc)

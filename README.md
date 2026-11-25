@@ -6,7 +6,7 @@
 
 - **多源日志解析**：XST 信令、QXDM/HDF（QCAT CLI）、SV/EI、pcap、CMAC/PDCP/RLC TTI CSV、WebLMT 配置
 - **多专家编排**：Orchestrator 总指挥 + DataParser 数据解析 + RadioAnalyst 无线推理 + KnowledgeRetriever 协议检索
-- **协议 RAG**：本地 3GPP 文档向量检索（语义向量 / 哈希双模式，失败自动降级）
+- **协议 RAG**：本地 3GPP 文档检索，混合召回（bge 语义向量 + BM25 关键词，RRF 融合）→ cross-encoder 重排 → 上下文压缩过滤，全离线，哈希兜底
 - **长期记忆**：SQLite 持久化 + 语义近似去重，自动沉淀历史案例
 - **Web 界面**：Gradio 交互式问答，支持多次拖入上传、实时日志、人工反馈中断
 - **可配置**：Critic 评审开关、embedding 方案、QCAT 分析器、各超时参数均可通过环境变量调整
@@ -62,9 +62,14 @@ python gradio_app.py
 见 `.env.example`。关键项：
 
 - `ENABLE_CRITIC=1` 开启 Critic 评审（默认关闭）
-- `RAG_EMBEDDING_MODE=hash` 强制离线哈希向量（不调用远端 embedding）
+- `RAG_EMBEDDING_MODE`：`local`（默认，本地 bge 语义向量）/ `hash`（离线词袋兜底）
+- `RAG_RERANK_ENABLED=0` 关闭重排（默认开启）；`RAG_RERANK_CANDIDATES` 调整候选数
+- `RAG_HYBRID_ENABLED=0` 关闭混合检索（默认开启，向量+BM25）；`RAG_WEIGHT_VECTOR/BM25` 调权重
+- `RAG_FILTER_ENABLED=0` 关闭上下文压缩过滤（默认开启，实测可缩减约 70% 注入 token）
 - `LTE_NR_SUB_AGENT_TIMEOUT` 子 Agent 超时（默认 300s）
 - `QCAT_EXE` / `QCAT_ANALYZERS` 本机 QCAT 配置
+
+RAG 首次使用会自动下载语义模型（embedding ~90MB、reranker ~570MB）到用户缓存目录，之后完全离线可用。如需关闭重排以提速，设 `RAG_RERANK_ENABLED=0`。
 
 ## 外部依赖
 
